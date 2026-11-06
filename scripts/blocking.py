@@ -289,6 +289,11 @@ class Renderer:
             # triangles fully in front
             front = (z > near).all(1)
             part = (z > near).any(1) & ~front
+            # cull triangles entirely outside the frame (big speed-up on crowded or wide sets)
+            zs = np.where(z > near, z, near)
+            sxa = W / 2 + f * x / zs; sya = H / 2 - f * y / zs
+            off = (sxa.max(1) < 0) | (sxa.min(1) > W) | (sya.max(1) < 0) | (sya.min(1) > H)
+            front &= ~off
             polys = [(np.stack([x[i], y[i], z[i]], 1), shade[i]) for i in np.nonzero(front)[0]]
             for i in np.nonzero(part)[0]:                     # clip against the near plane
                 P3 = np.stack([x[i], y[i], z[i]], 1); Cv = shade[i]; outp, outc = [], []
@@ -397,24 +402,44 @@ def parse_selection(sel, shots):
     return out
 
 
-def render_shots(shots, renderer, out_dir, name, fps=24, log=print):
-    """Renders the selected shots back to back. Writes <name>_clean.mp4, <name>_labeled.mp4, <name>_timing.txt."""
+_MP = {}
+
+def _mp_frame(job):
+    si, k = job
+    s, R, fps = _MP['shots'][si], _MP['R'], _MP['fps']
+    t = k / fps
+    nodes, cam = s.build(t)
+    return R.render(nodes, cam, t)
+
+
+def render_shots(shots, renderer, out_dir, name, fps=24, log=print, workers=None):
+    """Renders the selected shots back to back. Writes <name>_clean.mp4, <name>_labeled.mp4, <name>_timing.txt.
+    workers: number of processes (default = all CPU cores). Frames stay in order."""
+    import multiprocessing as mp
     os.makedirs(out_dir, exist_ok=True)
     W, H = renderer.W, renderer.H
     clean = _Writer(os.path.join(out_dir, f'{name}_clean.mp4'), W, H, fps)
     lab = _Writer(os.path.join(out_dir, f'{name}_labeled.mp4'), W, H, fps)
     lines = [f'{name}  total {sum(s.dur for s in shots):.2f}s  @ {fps}fps', 'Shot   in-out (this clip)   lens   title | action']
-    tg = 0.0
-    for s in shots:
+    jobs, starts, tg = [], [], 0.0
+    for si, s in enumerate(shots):
         n = max(1, int(round(s.dur * fps)))
-        for k in range(n):
-            t = k / fps
-            nodes, cam = s.build(t)
-            fr = renderer.render(nodes, cam, t)
-            clean.write(fr); lab.write(_label(fr, s, t, tg + t))
+        jobs += [(si, k) for k in range(n)]; starts.append(tg)
         lines.append(f'{s.id:<6} {tg:6.2f}-{tg + s.dur:6.2f}s  {s.lens:>3}mm  {s.title} | {s.note}')
-        log(f'  {s.id} done ({n} frames)')
         tg += s.dur
+    workers = workers or os.cpu_count() or 1
+    _MP.update(shots=shots, R=renderer, fps=fps)
+    done = {}
+    def emit(job, fr):
+        si, k = job; s = shots[si]; t = k / fps
+        clean.write(fr); lab.write(_label(fr, s, t, starts[si] + t))
+        done[si] = done.get(si, 0) + 1
+        if done[si] == max(1, int(round(s.dur * fps))): log(f'  {s.id} done ({done[si]} frames)')
+    if workers > 1 and 'fork' in mp.get_all_start_methods():
+        with mp.get_context('fork').Pool(workers) as pool:
+            for job, fr in zip(jobs, pool.imap(_mp_frame, jobs, chunksize=2)): emit(job, fr)
+    else:
+        for job in jobs: emit(job, _mp_frame(job))
     clean.close(); lab.close()
     open(os.path.join(out_dir, f'{name}_timing.txt'), 'w').write('\n'.join(lines) + '\n')
     return os.path.join(out_dir, f'{name}_clean.mp4')
